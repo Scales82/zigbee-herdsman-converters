@@ -1,6 +1,7 @@
 const index = require('../index');
 const exposes = require('../lib/exposes');
 const utils = require('../lib/utils');
+const tuya = require('../lib/tuya');
 const deepClone = (obj) => JSON.parse(JSON.stringify(obj));
 const equals = require('fast-deep-equal/es6');
 const fs = require('fs');
@@ -17,6 +18,15 @@ function containsOnly(array1, array2){
 }
 
 describe('index.js', () => {
+    it('Test utils.toNumber', () => {
+        expect(utils.toNumber('1')).toBe(1);
+        expect(utils.toNumber(5)).toBe(5);
+        expect(() => utils.toNumber('notanumber')).toThrowError('Value is not a number, got string (notanumber)');
+        expect(utils.toNumber('0')).toBe(0);
+        expect(utils.toNumber(0)).toBe(0);
+        expect(() => utils.toNumber('')).toThrowError('Value is not a number, got string ()');
+    });
+
     it('Legacy: Find by zigbeeModel', () => {
         const device = index.findByZigbeeModel('WaterSensor-N');
         expect(device.model).toBe('HS1WL/HS3WL')
@@ -94,6 +104,30 @@ describe('index.js', () => {
 
         const definition = index.findByDevice(device);
         expect(definition.model).toBe("RTCGQ01LM");
+    });
+
+    it('Find by fingerprint with priority', () => {
+        const HG06338 = {
+            type: 'Router',
+            manufacturerName: '_TZ3000_vzopcetz',
+            modelID: 'TS011F',
+            applicationVersion: 69,
+        };
+        const TS011F_plug_3 = {
+            type: 'Router',
+            manufacturerName: '_TZ3000_vzopcetz_random',
+            modelID: 'TS011F',
+            applicationVersion: 69,
+        };
+        const TS011F_plug_1 = {
+            type: 'Router',
+            manufacturerName: '_TZ3000_vzopcetz_random',
+            modelID: 'TS011F',
+            applicationVersion: 1,
+        };
+        expect(index.findByDevice(HG06338).model).toBe('HG06338');
+        expect(index.findByDevice(TS011F_plug_3).model).toBe('TS011F_plug_3');
+        expect(index.findByDevice(TS011F_plug_1).model).toBe('TS011F_plug_1');
     });
 
     it('Find by device should prefer fingerprint match over zigbeeModel', () => {
@@ -243,7 +277,7 @@ describe('index.js', () => {
             }
 
             // Check for duplicate model ids
-            if (foundModels.includes(device.model)) {
+            if (foundModels.includes(device.model.toLowerCase())) {
                 throw new Error(`Duplicate model ${device.model}`)
             }
 
@@ -261,20 +295,30 @@ describe('index.js', () => {
             }
 
             if (device.whiteLabel) {
-                for (const definition of device.whiteLabel) {
-                    containsOnly(['vendor', 'model', 'description'], Object.keys(definition));
+                for (const whiteLabel of device.whiteLabel) {
+                    verifyKeys(['vendor', 'model'], Object.keys(whiteLabel), `whitelabel-of-${device.model}`);
+                    containsOnly(['vendor', 'model', 'description', 'fingerprint'], Object.keys(whiteLabel));
+                    if (whiteLabel.fingerprint && foundModels.includes(whiteLabel.model.toLowerCase())) {
+                        throw new Error(`Duplicate whitelabel zigbee model ${whiteLabel.model}`)
+                    }
                 }
             }
 
+            // Add to found models after duplicate checks, within the same device, same models are allowed
+            // We do not allow whitelabels with a fingerprint to carry a duplicate model
+            foundModels.push(device.model.toLowerCase());
+            if (device.whiteLabel) {
+                foundModels.push(...device.whiteLabel.filter((w) => w.fingerprint).map((w) => w.model.toLowerCase()));
+            }
+
+
             if (device.meta) {
-                containsOnly(['disableActionGroup', 'multiEndpoint', 'applyRedFix', 'disableDefaultResponse', 'enhancedHue', 'timeout', 'supportsHueAndSaturation', 'battery', 'coverInverted', 'turnsOffAtBrightness1', 'coverStateFromTilt', 'pinCodeCount', 'tuyaThermostatSystemMode', 'tuyaThermostatPreset', 'tuyaThermostatPresetToSystemMode', 'thermostat', 'fanStateOn', 'separateWhite'], Object.keys(device.meta));
+                containsOnly(['disableActionGroup', 'multiEndpoint', 'multiEndpointSkip', 'multiEndpointEnforce', 'applyRedFix', 'disableDefaultResponse', 'supportsEnhancedHue', 'timeout', 'supportsHueAndSaturation', 'battery', 'coverInverted', 'turnsOffAtBrightness1', 'coverStateFromTilt', 'pinCodeCount', 'tuyaThermostatSystemMode', 'tuyaThermostatPreset', 'tuyaDatapoints', 'tuyaThermostatPresetToSystemMode', 'thermostat', 'fanStateOn', 'separateWhite', 'publishDuplicateTransaction', 'tuyaSendCommand'], Object.keys(device.meta));
             }
 
             if (device.zigbeeModel) {
                 foundZigbeeModels = foundZigbeeModels.concat(device.zigbeeModel.map((z) => z.toLowerCase()));
             }
-
-            foundModels.push(device.model);
         });
     });
 
@@ -349,6 +393,7 @@ describe('index.js', () => {
                 "property":"color_rgb",
                 "name":"color_xy",
                 "description": "Color of this light in the CIE 1931 color space (x/y)",
+                "access":7,
                 "features":[
                   {
                     "type":"numeric",
@@ -375,12 +420,15 @@ describe('index.js', () => {
     it('Exposes access matches toZigbee', () => {
         index.definitions.forEach((device) => {
             if (device.exposes) {
+                // tuya.tz.datapoints is generic, keys cannot be used to determine expose access
+                if (device.toZigbee.includes(tuya.tz.datapoints)) return;
+
                 const toCheck = [];
                 const expss = typeof device.exposes == 'function' ? device.exposes() : device.exposes;
                 for (const expose of expss) {
                     if (expose.hasOwnProperty('access')) {
                         toCheck.push(expose)
-                    } else if (expose.features && expose.type !== 'composite') {
+                    } else if (expose.features) {
                         toCheck.push(...expose.features.filter(e => e.hasOwnProperty('access')));
                     }
                 }
@@ -398,11 +446,36 @@ describe('index.js', () => {
                     }
 
                     if ((expose.access & exposes.access.GET) != (toZigbee && toZigbee.convertGet ? exposes.access.GET : 0)) {
-                        throw new Error(`${device.model} - ${property}, supports get: ${!!(toZigbee && toZigbee.convertGet)}`);
+                        throw new Error(`${device.model} - ${property} (${expose.name}), supports get: ${!!(toZigbee && toZigbee.convertGet)}`);
                     }
                 }
             }
         });
+    });
+
+    it('Find by fingerprint - whitelabel', () => {
+        const HG06492B = {
+            type: 'Router',
+            manufacturerName: '_TZ3000_oborybow',
+            modelID: 'TS0502A',
+            endpoints: [],
+        };
+        const TS0502A = {
+            type: 'Router',
+            manufacturerName: 'JUST_A_RANDOM_MANUFACTURER_NAME  ',
+            modelID: 'TS0502A',
+            endpoints: [],
+        };
+
+        const HG06492B_match = index.findByDevice(HG06492B)
+        expect(HG06492B_match.model).toBe('HG06492B');
+        expect(HG06492B_match.description).toBe('Livarno Lux E14 candle CCT');
+        expect(HG06492B_match.vendor).toBe('Lidl');
+
+        const TS0502A_match = index.findByDevice(TS0502A)
+        expect(TS0502A_match.model).toBe('TS0502A');
+        expect(TS0502A_match.description).toBe('Light controller');
+        expect(TS0502A_match.vendor).toBe('TuYa');
     });
 
     it('Check if all exposes have a color temp range', () => {
@@ -451,11 +524,6 @@ describe('index.js', () => {
         expect(index.getConfigureKey(definition1)).not.toBe(index.getConfigureKey(definition2));
     });
 
-    it('Calculate configure key legacy', () => {
-        const definition = index.findByZigbeeModel('MCT-340 SMA');
-        expect(index.getConfigureKey(definition)).toBe(1);
-    });
-
     it('Number exposes with set access should have a range', () => {
         index.definitions.forEach((device) => {
             if (device.exposes) {
@@ -483,14 +551,84 @@ describe('index.js', () => {
         const ZNCLDJ12LM = index.definitions.find((d) => d.model == 'ZNCLDJ12LM');
         expect(ZNCLDJ12LM.options.length).toBe(1);
         const ZNCZ04LM = index.definitions.find((d) => d.model == 'ZNCZ04LM');
-        expect(ZNCZ04LM.options.length).toBe(1);
+        expect(ZNCZ04LM.options.length).toBe(10);
     });
 
     it('Verify imports', () => {
-        const files = fs.readdirSync('devices');
+        const files = fs.readdirSync('src/devices');
         for (const file of files) {
-            const content = fs.readFileSync(`devices/${file}`, {encoding: 'utf-8'});
+            const content = fs.readFileSync(`src/devices/${file}`, {encoding: 'utf-8'});
             expect(content).not.toContain(`require('zigbee-herdsman-converters`);
         }
+    });
+
+    it('Check TuYa tuya.fz.datapoints calibration/presicion options', () => {
+        const TS0601_soil = index.definitions.find((d) => d.model == 'TS0601_soil');
+        expect(TS0601_soil.options.map((t) => t.name)).toStrictEqual(
+            ['temperature_precision', 'temperature_calibration']);
+    });
+
+    it('Check getFromLookup', () => {
+        expect(utils.getFromLookup('OFF', {'off': 0, 'on': 1, 'previous': 2})).toStrictEqual(0);
+        expect(utils.getFromLookup('On', {'off': 0, 'on': 1, 'previous': 2})).toStrictEqual(1);
+        expect(utils.getFromLookup('previous', {'OFF': 0, 'ON': 1, 'PREVIOUS': 2})).toStrictEqual(2);
+        expect(utils.getFromLookup(1, {0: 'OFF', 1: 'on'})).toStrictEqual('on');
+    });
+
+    it('List expose number', () => {
+        // Example payload:
+        // {"temperatures": [19,21,30]}
+        const itemType = exposes.numeric('temperature', exposes.access.STATE_SET);
+        const list = exposes.list('temperatures', exposes.access.STATE_SET, itemType);
+        expect(JSON.parse(JSON.stringify(list))).toStrictEqual({
+            "access": 3, 
+            "item_type": {"access": 3, "name": "temperature", "type": "numeric"}, 
+            "name": "temperatures", 
+            "property": "temperatures", 
+            "type": "list"
+        });
+    });
+
+    it('List expose composite', () => {
+        // Example payload:
+        // {"schedule": [{"day":"monday","hour":13,"minute":37}, {"day":"tuesday","hour":14,"minute":59}]}
+
+        const itemType = exposes.composite('dayTime', exposes.access.STATE_SET)
+            .withFeature(exposes.enum('day', exposes.access.STATE_SET, ['monday', 'tuesday', 'wednesday']))
+            .withFeature(exposes.numeric('hour', exposes.access.STATE_SET))
+            .withFeature(exposes.numeric('minute', exposes.access.STATE_SET))
+
+        const list = exposes.list('schedule', exposes.access.STATE_SET, itemType);
+        expect(JSON.parse(JSON.stringify(list))).toStrictEqual({
+            type: 'list',
+            name: 'schedule',
+            property: 'schedule',
+            access: 3,
+            item_type: {
+                type: 'composite',
+                name: 'dayTime',
+                features: [
+                    {
+                        access: 3, 
+                        name: "day", 
+                        property: "day", 
+                        type: "enum",
+                        values: ['monday', 'tuesday', 'wednesday'],
+                    },
+                    {
+                        access: 3, 
+                        name: "hour", 
+                        property: "hour", 
+                        type: "numeric",
+                    },
+                    {
+                        access: 3, 
+                        name: "minute", 
+                        property: "minute", 
+                        type: "numeric",
+                    },
+                ]
+            }
+        });
     });
 });
